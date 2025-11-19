@@ -289,6 +289,40 @@ In multi-step tool execution:
 
 The proxy tracks all signatures by `tool_call_id`.
 
+### Rate Limit Handling (429 Errors)
+
+The proxy automatically handles Gemini API rate limits with **exponential backoff retry**:
+
+**How it works:**
+1. When Gemini returns 429 (Too Many Requests)
+2. Proxy waits with exponential backoff: 1s, 2s, 4s, 8s, 16s
+3. Respects `Retry-After` header if provided by Gemini
+4. Retries up to 5 times before giving up
+5. Transparent to Factory Droid (eventual success or final failure)
+
+**Example flow:**
+```
+Request → 429 → Wait 1s → Retry → 429 → Wait 2s → Retry → 200 OK ✓
+```
+
+**Logging:**
+```
+[Proxy] 429 Rate Limited - Retry 1/4 after 1000ms
+[Proxy] 429 Rate Limited - Retry 2/4 after 2000ms
+[Proxy] ✓ Success with 12 tools
+```
+
+**Common scenarios:**
+- **Tool retry storms**: When a tool fails and Factory retries multiple times rapidly, rate limits can trigger
+- **Long sessions**: Heavy tool usage over extended periods
+- **Concurrent requests**: Multiple Factory Droid instances using same API key
+
+**What you see:**
+- **With retry**: Brief pause, then request succeeds automatically
+- **Max retries exceeded**: Final 429 error propagated to Factory Droid
+
+The proxy makes rate limiting transparent in most cases, automatically recovering from temporary rate limit spikes.
+
 ## Logging
 
 The proxy provides detailed logging:
@@ -370,6 +404,29 @@ Proxy isn't running. Start it:
 ```bash
 node gemini-proxy.js &
 ```
+
+### Still Getting 429 Errors After Retries
+
+If you see:
+```
+[Proxy] 429 Rate Limited - Max retries (5) exceeded
+Error: 429 status code (no body)
+```
+
+**Causes:**
+- Sustained high request rate exceeding Gemini's limits
+- Multiple Factory Droid instances sharing same API key
+- Gemini free tier limits hit
+
+**Solutions:**
+
+1. **Reduce concurrency:** Avoid running multiple Factory Droid instances simultaneously
+2. **Upgrade API tier:** Check Google AI Studio for higher rate limits
+3. **Add delays:** If using Factory programmatically, add delays between requests
+4. **Check quotas:** Visit https://aistudio.google.com to view your API quota usage
+
+**Temporary workaround:**
+Wait 1-2 minutes for rate limits to reset, then retry your request.
 
 ## Technical Details
 

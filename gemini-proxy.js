@@ -228,12 +228,14 @@ async function makeRequestWithRetry(options, body, requestData, maxRetries = 5) 
         extractThoughtSignatures(result.decompressedData);
       }
 
-      // Handle 429 - retry with exponential backoff
+      // Handle 429 - retry with longer exponential backoff
       if (result.statusCode === 429) {
         const retryAfter = result.headers['retry-after'];
+        // Longer delays: 2s, 5s, 10s, 20s, 40s
+        const delays = [2000, 5000, 10000, 20000, 40000];
         const delay = retryAfter
           ? parseInt(retryAfter) * 1000
-          : Math.pow(2, attempt) * 1000; // Exponential: 1s, 2s, 4s, 8s, 16s
+          : delays[attempt] || delays[delays.length - 1];
 
         if (attempt < maxRetries - 1) {
           console.log(`[Proxy] 429 Rate Limited - Retry ${attempt + 1}/${maxRetries - 1} after ${delay}ms`);
@@ -241,6 +243,19 @@ async function makeRequestWithRetry(options, body, requestData, maxRetries = 5) 
           continue; // Retry
         } else {
           console.error(`[Proxy] 429 Rate Limited - Max retries (${maxRetries}) exceeded`);
+        }
+      }
+
+      // Handle 503 - retry with faster recovery
+      if (result.statusCode === 503) {
+        const max503Retries = 3;
+        if (attempt < max503Retries) {
+          const delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
+          console.log(`[Proxy] 503 Service Unavailable - Retry ${attempt + 1}/${max503Retries} after ${delay}ms`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue; // Retry
+        } else {
+          console.error(`[Proxy] 503 Service Unavailable - Max retries (${max503Retries}) exceeded`);
         }
       }
 

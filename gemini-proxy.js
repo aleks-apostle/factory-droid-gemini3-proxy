@@ -453,14 +453,101 @@ async function makeRequestWithRetry(options, body, requestData, conversationId, 
             // Write response headers immediately for streaming
             clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
 
+            // Buffer for finish_reason chunks that may need correction (Gemini API bug fix)
+            const finishReasonChunks = [];
+
             proxyRes.on('data', chunk => {
               lastChunkTime = Date.now();
 
-              // Forward chunk to client immediately (real-time streaming)
-              clientRes.write(chunk);
-
-              // Also buffer for signature extraction
+              // Buffer all chunks for signature extraction and final analysis
               responseBody.push(chunk);
+
+              // Check chunk content for special markers
+              const chunkStr = chunk.toString('utf8');
+              const isDone = chunkStr.includes('data: [DONE]');
+
+              if (isDone) {
+                // FIX: Parse full accumulated buffer to check for tool_calls
+                // accumulatedToolCalls is often empty because chunks are split mid-JSON
+                // The full buffer contains complete SSE events that parse correctly
+                let hasToolCallsInResponse = false;
+
+                try {
+                  const fullBuffer = Buffer.concat(responseBody);
+                  const parsedChunks = parseSSEChunks(fullBuffer);
+
+                  // Check if any chunk contains tool_calls
+                  for (const chunk of parsedChunks) {
+                    const choices = chunk.choices || [];
+                    for (const choice of choices) {
+                      if (choice.delta?.tool_calls) {
+                        hasToolCallsInResponse = true;
+                        console.log('[Proxy] ✓ Found tool_calls in response - will correct finish_reason');
+                        break;
+                      }
+                    }
+                    if (hasToolCallsInResponse) break;
+                  }
+                } catch (e) {
+                  console.warn('[Proxy] Error parsing full buffer for tool_calls check:', e.message);
+                  // Fallback to accumulatedToolCalls (will likely be empty)
+                  hasToolCallsInResponse = Object.keys(accumulatedToolCalls).length > 0;
+                }
+
+                // Flush buffered finish_reason chunks (with correction if needed)
+                for (const frChunk of finishReasonChunks) {
+                  let outputChunk = frChunk;
+
+                  if (hasToolCallsInResponse) {
+                    // Fix Gemini API bug: finish_reason should be "tool_calls" not "stop"
+                    const frChunkStr = frChunk.toString('utf8');
+                    const correctedStr = frChunkStr.replace(
+                      /"finish_reason"\s*:\s*"stop"/g,
+                      '"finish_reason":"tool_calls"'
+                    );
+
+                    if (correctedStr !== frChunkStr) {
+                      console.log('[Proxy] ✓ Fixed Gemini bug: finish_reason "stop" -> "tool_calls"');
+                      outputChunk = Buffer.from(correctedStr, 'utf8');
+                    } else {
+                      console.log('[Proxy] finish_reason chunk already correct (not "stop")');
+                    }
+                  } else {
+                    console.log('[Proxy] No tool_calls detected - sending finish_reason as-is');
+                  }
+
+                  clientRes.write(outputChunk);
+                }
+
+                console.log('[Proxy] Sending [DONE] marker');
+                // FIX: Check if [DONE] chunk itself contains finish_reason that needs correction
+                // This handles the case where finish_reason and [DONE] arrive in the same chunk
+                let doneChunk = chunk;
+                const doneChunkStr = chunk.toString('utf8');
+
+                if (hasToolCallsInResponse && doneChunkStr.includes('"finish_reason"')) {
+                  const correctedStr = doneChunkStr.replace(
+                    /"finish_reason"\s*:\s*"stop"/g,
+                    '"finish_reason":"tool_calls"'
+                  );
+
+                  if (correctedStr !== doneChunkStr) {
+                    console.log('[Proxy] ✓ Fixed finish_reason in [DONE] chunk itself');
+                    doneChunk = Buffer.from(correctedStr, 'utf8');
+                  } else {
+                    console.log('[Proxy] [DONE] chunk finish_reason already correct');
+                  }
+                }
+
+                clientRes.write(doneChunk);
+                console.log('[Proxy] ═══ [DONE] PROCESSING COMPLETE ═══');
+              } else if (chunkStr.includes('"finish_reason"')) {
+                // Buffer this chunk - may need correction before sending
+                finishReasonChunks.push(chunk);
+              } else {
+                // Forward immediately - maintains streaming performance
+                clientRes.write(chunk);
+              }
 
               // Try to extract signatures from this chunk
               try {
@@ -468,7 +555,10 @@ async function makeRequestWithRetry(options, body, requestData, conversationId, 
                 extractSignaturesFromStreamChunks(sseChunks, accumulatedToolCalls, conversationId);
               } catch (e) {
                 // Don't break streaming if signature extraction fails
-                console.warn('[Proxy] Error extracting signatures from stream chunk:', e.message);
+                // This is EXPECTED when chunks are split mid-JSON - will parse from full buffer at end
+                console.warn('[Proxy] ⚠️  Failed to parse chunk for signatures (likely split mid-JSON):', e.message);
+                const chunkSnippet = chunk.toString('utf8').substring(0, 80).replace(/\n/g, '\\n');
+                console.warn('[Proxy]    Chunk size:', chunk.length, 'bytes, snippet:', chunkSnippet);
               }
             });
 
@@ -484,7 +574,21 @@ async function makeRequestWithRetry(options, body, requestData, conversationId, 
               // DIAGNOSTIC: Extract and log finish_reason from streaming response
               // This helps debug why agent stops after 2-3 tool calls
               try {
-                const chunks = parseSSEChunks(responseData);
+                // FIX: Decompress gzipped streaming responses before parsing
+                // Streaming responses can be gzipped, but parseSSEChunks expects plain text
+                const isGzipped = proxyRes.headers['content-encoding'] === 'gzip';
+                const decompressedData = isGzipped
+                  ? zlib.gunzipSync(responseData)
+                  : responseData;
+
+                const chunks = parseSSEChunks(decompressedData);
+
+                // Warn if no chunks parsed
+                if (chunks.length === 0) {
+                  console.warn('[Proxy] ⚠️  parseSSEChunks returned 0 chunks!');
+                  console.warn('[Proxy] Response size:', responseData.length, 'bytes');
+                }
+
                 let lastFinishReason = null;
                 let hasToolCalls = false;
                 let contentLength = 0;
@@ -518,9 +622,11 @@ async function makeRequestWithRetry(options, body, requestData, conversationId, 
                     console.log(`[Proxy]   content_length: ${contentLength}`);
 
                     // Validate finish_reason matches response state
-                    if (hasToolCalls && lastFinishReason === 'stop') {
-                      console.warn(`[Proxy] ⚠️  WARNING: Response has tool_calls but finish_reason is "stop" (expected "tool_calls")`);
-                    }
+                    // NOTE: BUG DETECTION for "stop" when hasToolCalls is removed because:
+                    // - The diagnostic analyzes responseBody (Gemini's original response)
+                    // - The actual fix corrects finish_reason before sending to client
+                    // - This diagnostic would show false alarms even when client receives correct data
+
                     if (lastFinishReason === 'stop' && !hasToolCalls && contentLength === 0) {
                       console.warn(`[Proxy] ⚠️  WARNING: Empty response with finish_reason "stop" - agent may halt prematurely`);
                     }
@@ -528,9 +634,15 @@ async function makeRequestWithRetry(options, body, requestData, conversationId, 
                       console.warn(`[Proxy] ⚠️  WARNING: Context limit hit (finish_reason: "length") - response truncated`);
                     }
                   }
+                } else if (chunks.length > 0) {
+                  // Warn if we parsed chunks but got no finish_reason
+                  console.warn('[Proxy] ⚠️  All chunks had finish_reason: null (missing final chunk?)');
                 }
               } catch (e) {
-                console.warn('[Proxy] Could not extract finish_reason from streaming response:', e.message);
+                console.error('[Proxy] ERROR extracting finish_reason from streaming response');
+                console.error('[Proxy] Error:', e.message);
+                console.error('[Proxy] Stack:', e.stack);
+                console.error('[Proxy] Response buffer size:', responseData?.length || 0, 'bytes');
               }
 
               resolve({
@@ -741,6 +853,10 @@ const server = http.createServer((clientReq, clientRes) => {
         'content-length': body.length
       }
     };
+
+    // FIX: Don't request gzipped responses from Gemini
+    // This allows us to search/modify chunks (fix finish_reason bug) before forwarding to client
+    delete options.headers['accept-encoding'];
 
     // Use async handler with retry
     // Pass clientRes for streaming support

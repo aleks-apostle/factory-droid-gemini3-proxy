@@ -343,8 +343,8 @@ function parseSSEChunks(buffer) {
         const data = JSON.parse(dataStr);
         chunks.push(data);
       } catch (e) {
-        // Invalid JSON, skip this chunk
-        console.warn('[Proxy] Invalid JSON in SSE chunk:', e.message);
+        // Expected when chunks are split mid-JSON - will parse from full buffer later
+        // Silently skip invalid JSON chunks
       }
     }
   }
@@ -554,11 +554,8 @@ async function makeRequestWithRetry(options, body, requestData, conversationId, 
                 const sseChunks = parseSSEChunks(chunk);
                 extractSignaturesFromStreamChunks(sseChunks, accumulatedToolCalls, conversationId);
               } catch (e) {
-                // Don't break streaming if signature extraction fails
-                // This is EXPECTED when chunks are split mid-JSON - will parse from full buffer at end
-                console.warn('[Proxy] ⚠️  Failed to parse chunk for signatures (likely split mid-JSON):', e.message);
-                const chunkSnippet = chunk.toString('utf8').substring(0, 80).replace(/\n/g, '\\n');
-                console.warn('[Proxy]    Chunk size:', chunk.length, 'bytes, snippet:', chunkSnippet);
+                // Expected when chunks are split mid-JSON - signatures will be extracted from full buffer at end
+                // Silently continue
               }
             });
 
@@ -609,33 +606,18 @@ async function makeRequestWithRetry(options, body, requestData, conversationId, 
                   }
                 }
 
-                // Log finish_reason if found
+                // Log finish_reason and validate response state
                 if (lastFinishReason) {
-                  console.log(`[Proxy] Streaming finish_reason: ${lastFinishReason}`);
-
-                  // Check if this request contains tool results
                   const hasToolResults = requestData?.messages?.some(m => m.role === 'tool');
 
-                  if (hasToolResults) {
-                    console.log(`[Proxy] After tool results - finish_reason: ${lastFinishReason}`);
-                    console.log(`[Proxy]   has_tool_calls: ${hasToolCalls}`);
-                    console.log(`[Proxy]   content_length: ${contentLength}`);
-
-                    // Validate finish_reason matches response state
-                    // NOTE: BUG DETECTION for "stop" when hasToolCalls is removed because:
-                    // - The diagnostic analyzes responseBody (Gemini's original response)
-                    // - The actual fix corrects finish_reason before sending to client
-                    // - This diagnostic would show false alarms even when client receives correct data
-
-                    if (lastFinishReason === 'stop' && !hasToolCalls && contentLength === 0) {
-                      console.warn(`[Proxy] ⚠️  WARNING: Empty response with finish_reason "stop" - agent may halt prematurely`);
-                    }
-                    if (lastFinishReason === 'length') {
-                      console.warn(`[Proxy] ⚠️  WARNING: Context limit hit (finish_reason: "length") - response truncated`);
-                    }
+                  // Warn about potential issues
+                  if (hasToolResults && lastFinishReason === 'stop' && !hasToolCalls && contentLength === 0) {
+                    console.warn(`[Proxy] ⚠️  WARNING: Empty response with finish_reason "stop" - agent may halt prematurely`);
+                  }
+                  if (lastFinishReason === 'length') {
+                    console.warn(`[Proxy] ⚠️  WARNING: Context limit hit (finish_reason: "length") - response truncated`);
                   }
                 } else if (chunks.length > 0) {
-                  // Warn if we parsed chunks but got no finish_reason
                   console.warn('[Proxy] ⚠️  All chunks had finish_reason: null (missing final chunk?)');
                 }
               } catch (e) {
